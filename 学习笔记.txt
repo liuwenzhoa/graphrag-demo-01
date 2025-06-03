@@ -1,0 +1,25 @@
+告诉我如何使用ktransformers正确部署Qwen3-235B-A22B
+服务器设备信息：
+系统环境：PyTorch 2.5.1，Python 3.11(ubuntu22.04)，CUDA 12.4
+GPU：RTX 4090D(24GB) * 5
+CPU：75 vCPU Intel(R) Xeon(R) Platinum 8474CPU @ 2.50GHz
+内存：400GB
+硬盘系统盘：30 GB
+数据盘：430GB SSD
+参考文档：
+1. @AMX.md 和文档目录：@zh其他所有文档以及rules规则
+2. 模型配置文件 @configuration_qwen3_moe.py  和 @modeling_qwen3_moe.py 
+联网搜索：
+1.使用 playwright MCP了解GGUF格式的模型权重，网址为： https://huggingface.co/unsloth/Qwen3-235B-A22B-GGUF 和 https://huggingface.co/unsloth/Qwen3-235B-A22B-GGUF/tree/main
+2.使用 playwright MCP了解Qwen3，网址：https://github.com/QwenLM/Qwen3 和 https://qwenlm.github.io/zh/blog/qwen3/
+关键问题和任务：
+1.你需要确定ktransformers支持Qwen3-235B-A22B的哪个量化版本
+2.qwen3没有提供架构源码，所以我不清楚通过 ktransformers 如何启动服务，我不清楚model_path如何配置。
+3.通过我给你的模型配置文件，了解是否通过这些文件启动服务？
+4.需要给出使用amx和不使用amx的部署方案。
+5.最后修改这个部署步骤文件 @qwen3-235B部署步骤.md  ，替换成qwen3模型的部署步骤
+因为Qwen3并没有提供model架构文件，所以k自己实现了一套架构文件
+然后这个config.json会被Qwen3MoeConfig类实现进行加载，我们之前把Qwen3原版模型配置文件下载到了Qwen3-235B-A22B这个目录中
+qwen3-235B半精度的function call能力在我看来是很强的，与deepseek V3没有多大差别。所以说Qwen3-235B+KT的部署方案非常适合企业级智能体开发
+
+
