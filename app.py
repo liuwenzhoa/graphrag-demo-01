@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field
 import uvicorn
 import os
 
-from graphrag_demo_01.graphrag_service import GraphRAGService
+# 修复导入路径 - 直接从同目录导入
+from graphrag_service import GraphRAGService
 
 # 配置日志
 logging.basicConfig(
@@ -109,7 +110,10 @@ app.add_middleware(
 )
 
 # 挂载静态文件服务（用于提供HTML界面）
-app.mount("/static", StaticFiles(directory="."), name="static")
+try:
+    app.mount("/static", StaticFiles(directory="."), name="static")
+except Exception as e:
+    logger.warning(f"无法挂载静态文件服务: {e}")
 
 # ========== 配置和状态管理接口 ==========
 
@@ -306,30 +310,44 @@ async def basic_search(request: BasicSearchRequest):
         logger.error(f"基本搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== 流式搜索接口 ==========
+# ========== 改进的流式搜索接口 ==========
 
-@app.post("/api/search/global/stream")
-async def global_search_streaming(request: SearchRequest):
-    """流式全局搜索"""
-    try:
-        async def generate():
-            try:
-                # 创建一个队列来处理流式数据
-                import asyncio
-                queue = asyncio.Queue()
-                
-                def callback(chunk: str):
-                    """同步回调转异步"""
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                    except Exception:
-                        pass
-                
-                # 启动搜索任务
-                async def search_task():
-                    try:
-                        full_response, context = await graphrag_service.global_search_streaming(
+async def create_streaming_response(search_func, request, search_type: str):
+    """创建流式响应的通用函数"""
+    async def generate():
+        try:
+            import json
+            from queue import Queue
+            import threading
+            
+            # 使用线程安全的队列
+            response_queue = Queue()
+            error_occurred = False
+            
+            def callback(chunk: str):
+                """回调函数，将数据放入队列"""
+                try:
+                    if chunk and chunk.strip():
+                        response_queue.put(("data", chunk))
+                except Exception as e:
+                    logger.error(f"Callback error: {e}")
+                    response_queue.put(("error", str(e)))
+            
+            async def search_task():
+                """执行搜索任务"""
+                nonlocal error_occurred
+                try:
+                    if search_type == "basic":
+                        await search_func(
+                            query=request.query,
+                            k=request.k,
+                            temperature=request.temperature,
+                            top_p=request.top_p,
+                            max_tokens=request.max_tokens,
+                            callback=callback
+                        )
+                    else:
+                        await search_func(
                             query=request.query,
                             community_level=request.community_level,
                             temperature=request.temperature,
@@ -337,50 +355,78 @@ async def global_search_streaming(request: SearchRequest):
                             max_tokens=request.max_tokens,
                             callback=callback
                         )
-                        # 搜索完成后发送结束标记
-                        await queue.put("[DONE]")
-                    except Exception as e:
-                        await queue.put(f"ERROR: {str(e)}")
-                
-                # 启动搜索任务
-                task = asyncio.create_task(search_task())
-                
-                # 实时发送数据
-                while True:
-                    try:
-                        # 等待数据，设置超时避免无限等待
-                        chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        
-                        if chunk == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        elif chunk.startswith("ERROR:"):
-                            yield f"data: {chunk}\n\n"
-                            break
-                        else:
-                            yield f"data: {chunk}\n\n"
-                            
-                    except asyncio.TimeoutError:
-                        # 超时时发送心跳
-                        yield "data: \n\n"
-                        continue
-                    except Exception as e:
-                        yield f"data: ERROR: {str(e)}\n\n"
-                        break
-                
-                # 确保任务完成
-                if not task.done():
-                    task.cancel()
                     
-            except Exception as e:
-                yield f"data: ERROR: {str(e)}\n\n"
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+                    response_queue.put(("done", None))
+                    
+                except Exception as e:
+                    error_occurred = True
+                    logger.error(f"{search_type} streaming search error: {e}")
+                    response_queue.put(("error", str(e)))
+            
+            # 启动搜索任务
+            task = asyncio.create_task(search_task())
+            
+            # 发送流式数据
+            while True:
+                try:
+                    # 检查队列是否有数据
+                    if not response_queue.empty():
+                        msg_type, content = response_queue.get_nowait()
+                        
+                        if msg_type == "data":
+                            yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
+                        elif msg_type == "error":
+                            yield f"data: {json.dumps({'type': 'error', 'content': content}, ensure_ascii=False)}\n\n"
+                            break
+                        elif msg_type == "done":
+                            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+                            break
+                    else:
+                        # 短暂等待，避免CPU占用过高
+                        await asyncio.sleep(0.1)
+                    
+                    # 检查任务是否已完成
+                    if task.done() and response_queue.empty():
+                        if not error_occurred:
+                            yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+                        break
+                        
+                except Exception as e:
+                    logger.error(f"Stream generation error: {e}")
+                    yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+                    break
+            
+            # 确保任务完成
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Streaming response error: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/plain; charset=utf-8"
+        }
+    )
+
+@app.post("/api/search/global/stream")
+async def global_search_streaming(request: SearchRequest):
+    """流式全局搜索"""
+    try:
+        return await create_streaming_response(
+            graphrag_service.global_search_streaming,
+            request,
+            "global"
         )
-        
     except Exception as e:
         logger.error(f"流式全局搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -389,66 +435,11 @@ async def global_search_streaming(request: SearchRequest):
 async def local_search_streaming(request: SearchRequest):
     """流式本地搜索"""
     try:
-        async def generate():
-            try:
-                import asyncio
-                queue = asyncio.Queue()
-                
-                def callback(chunk: str):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                    except Exception:
-                        pass
-                
-                async def search_task():
-                    try:
-                        full_response, context = await graphrag_service.local_search_streaming(
-                            query=request.query,
-                            community_level=request.community_level,
-                            temperature=request.temperature,
-                            top_p=request.top_p,
-                            max_tokens=request.max_tokens,
-                            callback=callback
-                        )
-                        await queue.put("[DONE]")
-                    except Exception as e:
-                        await queue.put(f"ERROR: {str(e)}")
-                
-                task = asyncio.create_task(search_task())
-                
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        
-                        if chunk == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        elif chunk.startswith("ERROR:"):
-                            yield f"data: {chunk}\n\n"
-                            break
-                        else:
-                            yield f"data: {chunk}\n\n"
-                            
-                    except asyncio.TimeoutError:
-                        yield "data: \n\n"
-                        continue
-                    except Exception as e:
-                        yield f"data: ERROR: {str(e)}\n\n"
-                        break
-                
-                if not task.done():
-                    task.cancel()
-                    
-            except Exception as e:
-                yield f"data: ERROR: {str(e)}\n\n"
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        return await create_streaming_response(
+            graphrag_service.local_search_streaming,
+            request,
+            "local"
         )
-        
     except Exception as e:
         logger.error(f"流式本地搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -457,66 +448,11 @@ async def local_search_streaming(request: SearchRequest):
 async def drift_search_streaming(request: SearchRequest):
     """流式DRIFT搜索"""
     try:
-        async def generate():
-            try:
-                import asyncio
-                queue = asyncio.Queue()
-                
-                def callback(chunk: str):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                    except Exception:
-                        pass
-                
-                async def search_task():
-                    try:
-                        full_response, context = await graphrag_service.drift_search_streaming(
-                            query=request.query,
-                            community_level=request.community_level,
-                            temperature=request.temperature,
-                            top_p=request.top_p,
-                            max_tokens=request.max_tokens,
-                            callback=callback
-                        )
-                        await queue.put("[DONE]")
-                    except Exception as e:
-                        await queue.put(f"ERROR: {str(e)}")
-                
-                task = asyncio.create_task(search_task())
-                
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        
-                        if chunk == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        elif chunk.startswith("ERROR:"):
-                            yield f"data: {chunk}\n\n"
-                            break
-                        else:
-                            yield f"data: {chunk}\n\n"
-                            
-                    except asyncio.TimeoutError:
-                        yield "data: \n\n"
-                        continue
-                    except Exception as e:
-                        yield f"data: ERROR: {str(e)}\n\n"
-                        break
-                
-                if not task.done():
-                    task.cancel()
-                    
-            except Exception as e:
-                yield f"data: ERROR: {str(e)}\n\n"
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        return await create_streaming_response(
+            graphrag_service.drift_search_streaming,
+            request,
+            "drift"
         )
-        
     except Exception as e:
         logger.error(f"流式DRIFT搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -525,119 +461,83 @@ async def drift_search_streaming(request: SearchRequest):
 async def basic_search_streaming(request: BasicSearchRequest):
     """流式基本搜索"""
     try:
-        async def generate():
-            try:
-                import asyncio
-                queue = asyncio.Queue()
-                
-                def callback(chunk: str):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
-                    except Exception:
-                        pass
-                
-                async def search_task():
-                    try:
-                        full_response, context = await graphrag_service.basic_search_streaming(
-                            query=request.query,
-                            k=request.k,
-                            temperature=request.temperature,
-                            top_p=request.top_p,
-                            max_tokens=request.max_tokens,
-                            callback=callback
-                        )
-                        await queue.put("[DONE]")
-                    except Exception as e:
-                        await queue.put(f"ERROR: {str(e)}")
-                
-                task = asyncio.create_task(search_task())
-                
-                while True:
-                    try:
-                        chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
-                        
-                        if chunk == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        elif chunk.startswith("ERROR:"):
-                            yield f"data: {chunk}\n\n"
-                            break
-                        else:
-                            yield f"data: {chunk}\n\n"
-                            
-                    except asyncio.TimeoutError:
-                        yield "data: \n\n"
-                        continue
-                    except Exception as e:
-                        yield f"data: ERROR: {str(e)}\n\n"
-                        break
-                
-                if not task.done():
-                    task.cancel()
-                    
-            except Exception as e:
-                yield f"data: ERROR: {str(e)}\n\n"
-        
-        return StreamingResponse(
-            generate(),
-            media_type="text/plain",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        return await create_streaming_response(
+            graphrag_service.basic_search_streaming,
+            request,
+            "basic"
         )
-        
     except Exception as e:
         logger.error(f"流式基本搜索失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ========== 工具接口 ==========
+# ========== 其他接口 ==========
 
 @app.get("/api/context", response_model=ApiResponse)
 async def get_context():
-    """获取最近查询的上下文数据"""
+    """获取最近搜索的上下文数据"""
     try:
-        context = graphrag_service.get_context()
+        context = getattr(graphrag_service, 'context_data', {})
         return ApiResponse(
             status="success",
             data={"context": context}
         )
     except Exception as e:
-        logger.error(f"获取上下文失败: {str(e)}")
+        logger.error(f"获取上下文数据失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# ========== 健康检查接口 ==========
 
 @app.get("/health")
 async def health_check():
     """健康检查"""
-    return {"status": "healthy", "service": "GraphRAG Web API"}
+    status = graphrag_service.get_status()
+    return {
+        "status": "healthy",
+        "service_status": status["service_status"],
+        "index_status": status["index_status"]
+    }
 
 @app.get("/")
 async def root():
-    """根路径 - 提供HTML界面"""
-    # 检查HTML文件是否存在
-    html_path = os.path.join(os.path.dirname(__file__), "index.html")
-    if os.path.exists(html_path):
-        return FileResponse(html_path)
-    else:
+    """根路径，重定向到API文档"""
+    try:
+        # 尝试返回index.html文件
+        if os.path.exists("index.html"):
+            return FileResponse("index.html")
+        else:
+            return {
+                "message": "GraphRAG Web API服务",
+                "docs": "/docs",
+                "redoc": "/redoc",
+                "health": "/health"
+            }
+    except Exception as e:
+        logger.error(f"根路径访问失败: {e}")
         return {
-            "message": "GraphRAG Web API",
-            "version": "1.0.0",
+            "message": "GraphRAG Web API服务",
             "docs": "/docs",
-            "health": "/health",
-            "note": "HTML界面文件不存在，请确保index.html文件在正确位置"
+            "redoc": "/redoc",
+            "health": "/health"
         }
 
 @app.get("/api")
 async def api_info():
     """API信息"""
     return {
-        "message": "GraphRAG Web API",
+        "name": "GraphRAG Web API",
         "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health"
+        "description": "基于GraphRAG的知识图谱搜索API服务",
+        "endpoints": {
+            "init": "POST /api/init",
+            "status": "GET /api/status",
+            "build_index": "POST /api/index/build",
+            "load_index": "POST /api/index/load",
+            "global_search": "POST /api/search/global",
+            "local_search": "POST /api/search/local",
+            "drift_search": "POST /api/search/drift",
+            "basic_search": "POST /api/search/basic",
+            "streaming_searches": "POST /api/search/{type}/stream"
+        }
     }
 
-# 启动服务
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",

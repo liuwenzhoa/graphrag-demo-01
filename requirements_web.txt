@@ -1,21 +1,48 @@
-# GraphRAG Web服务依赖
+# GraphRAG Web Service Dependencies
 
-# FastAPI和Web服务
+# FastAPI and Web Service
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 
-# HTTP客户端（用于测试）
-httpx>=0.25.0
+# CORS and Security
+python-multipart>=0.0.6
 
-# 测试框架
+# HTTP Client (for testing)
+httpx>=0.25.0
+requests>=2.31.0
+
+# Testing Framework
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
 
-# GraphRAG核心依赖（如果需要单独安装）
-# graphrag>=2.0.0
+# GraphRAG Core (inherit from requirements.txt)
+graphrag>=2.0.0
 
-# 其他可能需要的依赖
-python-dotenv>=1.0.0
+# Data Processing
 pandas>=2.0.0
-numpy>=1.24.0 
+numpy>=1.24.0
+
+# Vector Database
+lancedb>=0.3.0
+
+# Graph Processing  
+networkx>=3.0
+python-louvain>=0.16
+
+# NLP and Text Processing
+spacy>=3.6.0
+tiktoken>=0.4.0
+openai>=1.0.0
+
+# Environment Configuration
+python-dotenv>=1.0.0
+
+# Async Support
+aiofiles>=23.0.0
+
+# Data Formats
+pyarrow>=12.0.0
+
+# Logging
+loguru>=0.7.0 
