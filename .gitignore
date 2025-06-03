@@ -129,9 +129,6 @@ dmypy.json
 .pyre/
 
 # GraphRAG specific
-cache/
-logs/
-output/
 *.log
 
 # IDE
